@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>IPTV Web Player</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/hls.js/1.5.13/hls.min.js"></script>
+<style>
+:root{--bg:#121726;--panel:#1b2236;--line:#2c3550;--text:#e9edf7;--mute:#97a1bd;--accent:#ff5a4f;color-scheme:dark}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{background:var(--bg);color:var(--text);font:15px/1.4 "Space Grotesk",system-ui,sans-serif;display:flex;flex-direction:column}
+.bars{height:6px;background:linear-gradient(90deg,#c8c8c8 0 14.28%,#c8c820 0 28.56%,#20c8c8 0 42.84%,#20c820 0 57.12%,#c820c8 0 71.4%,#c82020 0 85.68%,#2020c8 0)}
+header{display:flex;gap:12px;align-items:center;padding:10px 16px;border-bottom:1px solid var(--line);flex-wrap:wrap}
+header h1{font-size:18px;margin:0 8px 0 0;font-weight:700}
+header form{display:flex;gap:8px;flex:1;min-width:240px}
+input,select,button{font:inherit;color:var(--text);background:var(--panel);border:1px solid var(--line);border-radius:6px;padding:8px 10px}
+input:focus-visible,select:focus-visible,button:focus-visible,.ch:focus-visible{outline:2px solid var(--accent);outline-offset:1px}
+header input[type=url]{flex:1;min-width:0}
+button{cursor:pointer}
+button.go{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:700}
+main{flex:1;display:grid;grid-template-columns:1fr 340px;min-height:0}
+.stage{display:flex;flex-direction:column;min-width:0;padding:16px;gap:10px}
+.screen{position:relative;background:#000;border-radius:8px;aspect-ratio:16/9;max-height:calc(100vh - 170px);width:100%;overflow:hidden;margin:0 auto}
+video{width:100%;height:100%;display:block;background:#000}
+.idle{position:absolute;inset:0;display:flex;flex-direction:column;justify-content:flex-end}
+.idle .bars{height:55%}
+.idle p{margin:0;padding:14px 16px;color:var(--mute);background:#000;flex:1}
+.now{font-weight:700;font-size:17px}
+.msg{color:var(--mute);min-height:1.4em}
+.msg.err{color:#ffb4ae}
+aside{border-left:1px solid var(--line);display:flex;flex-direction:column;min-height:0;background:var(--panel)}
+.filters{display:flex;gap:8px;padding:10px;border-bottom:1px solid var(--line)}
+.filters input{flex:1;min-width:0;background:var(--bg)}
+.filters select{max-width:120px;background:var(--bg)}
+#list{overflow:auto;flex:1;margin:0;padding:0;list-style:none}
+.ch{display:flex;align-items:center;gap:10px;padding:8px 10px;cursor:pointer;border-bottom:1px solid var(--line)}
+.ch:hover{background:#232c46}
+.ch.on{background:#2a2530;box-shadow:inset 3px 0 var(--accent)}
+.ch img,.ch .ph{width:36px;height:36px;object-fit:contain;border-radius:4px;background:var(--bg);flex:none}
+.ch .t{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.ch small{display:block;color:var(--mute)}
+.fav{background:none;border:0;padding:4px 6px;font-size:18px;color:var(--mute)}
+.fav.on{color:#ffc857}
+.count{padding:8px 12px;color:var(--mute);font-size:13px;border-top:1px solid var(--line)}
+@media(max-width:800px){main{grid-template-columns:1fr;grid-template-rows:auto 1fr}aside{border-left:0;border-top:1px solid var(--line)}.screen{max-height:none}}
+@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+<div class="bars"></div>
+<header>
+  <h1>IPTV Player</h1>
+  <form id="load">
+    <input id="url" type="url" placeholder="Playlist URL (.m3u / .m3u8)" aria-label="Playlist URL">
+    <button class="go" type="submit">Load playlist</button>
+  </form>
+  <label><input id="file" type="file" accept=".m3u,.m3u8,.txt" hidden><button type="button" id="pick">Open file</button></label>
+</header>
+<main>
+  <section class="stage">
+    <div class="screen">
+      <video id="v" controls autoplay playsinline></video>
+      <div class="idle" id="idle"><div class="bars"></div><p>Load a playlist, then pick a channel.</p></div>
+    </div>
+    <div class="now" id="now"></div>
+    <div class="msg" id="msg"></div>
+  </section>
+  <aside>
+    <div class="filters">
+      <input id="q" type="search" placeholder="Search channels" aria-label="Search channels">
+      <select id="grp" aria-label="Group"><option value="">All groups</option></select>
+    </div>
+    <ul id="list"></ul>
+    <div class="count" id="count"></div>
+  </aside>
+</main>
+<script>
+// Set your playlist here. It can also be changed in the page and is remembered in the browser.
+const DEFAULT_PLAYLIST = "https://premiumplugx.com/VIP/pluglist.php";
+
+const $ = id => document.getElementById(id);
+const v = $("v"), list = $("list");
+let channels = [], hls = null, current = -1;
+let favs = new Set(safeGet("iptv.favs", []));
+
+function safeGet(k, d){ try { return JSON.parse(localStorage.getItem(k)) ?? d } catch { return d } }
+function safeSet(k, val){ try { localStorage.setItem(k, JSON.stringify(val)) } catch {} }
+function say(t, err){ const m = $("msg"); m.textContent = t || ""; m.className = "msg" + (err ? " err" : ""); }
+
+function parseM3U(text){
+  const out = [], lines = text.split(/\r?\n/);
+  let meta = null;
+  for (const raw of lines){
+    const l = raw.trim();
+    if (!l) continue;
+    if (l.startsWith("#EXTINF")){
+      const attrs = {};
+      l.replace(/([\w-]+)="([^"]*)"/g, (_, k, val) => (attrs[k.toLowerCase()] = val));
+      meta = { name: (l.split(",").pop() || "").trim() || attrs["tvg-name"] || "Untitled", logo: attrs["tvg-logo"] || "", group: attrs["group-title"] || "Other" };
+    } else if (!l.startsWith("#") && /^https?:\/\//i.test(l)){
+      out.push({ ...(meta || { name: l, logo: "", group: "Other" }), url: l });
+      meta = null;
+    }
+  }
+  return out;
+}
+
+function setChannels(list_){
+  channels = list_;
+  const groups = [...new Set(channels.map(c => c.group))].sort();
+  $("grp").innerHTML = '<option value="">All groups</option><option value="__fav">Favorites</option>' + groups.map(g => `<option>${esc(g)}</option>`).join("");
+  render();
+}
+
+function esc(s){ return s.replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c])); }
+
+function render(){
+  const q = $("q").value.toLowerCase(), g = $("grp").value;
+  const shown = channels.map((c, i) => ({ c, i })).filter(({ c }) =>
+    (!q || c.name.toLowerCase().includes(q)) && (!g || (g === "__fav" ? favs.has(c.url) : c.group === g)));
+  list.innerHTML = "";
+  const frag = document.createDocumentFragment();
+  shown.slice(0, 500).forEach(({ c, i }) => {
+    const li = document.createElement("li");
+    li.className = "ch" + (i === current ? " on" : "");
+    li.tabIndex = 0;
+    li.innerHTML = (c.logo ? `<img src="${esc(c.logo)}" alt="" loading="lazy" onerror="this.replaceWith(Object.assign(document.createElement('div'),{className:'ph'}))">` : '<div class="ph"></div>') +
+      `<div class="t">${esc(c.name)}<small>${esc(c.group)}</small></div>` +
+      `<button class="fav${favs.has(c.url) ? " on" : ""}" aria-label="Toggle favorite">${favs.has(c.url) ? "★" : "☆"}</button>`;
+    li.onclick = e => { if (e.target.closest(".fav")) { toggleFav(c.url); } else play(i); };
+    li.onkeydown = e => { if (e.key === "Enter") play(i); };
+    frag.appendChild(li);
+  });
+  list.appendChild(frag);
+  $("count").textContent = channels.length ? `${shown.length} of ${channels.length} channels` + (shown.length > 500 ? " (showing first 500, use search)" : "") : "";
+}
+
+function toggleFav(url){ favs.has(url) ? favs.delete(url) : favs.add(url); safeSet("iptv.favs", [...favs]); render(); }
+
+function play(i){
+  const c = channels[i]; if (!c) return;
+  current = i; render();
+  $("idle").hidden = true;
+  $("now").textContent = c.name;
+  say("Loading stream…");
+  if (hls){ hls.destroy(); hls = null; }
+  const isHls = /\.m3u8(\?|$)/i.test(c.url);
+  if (isHls && window.Hls && Hls.isSupported()){
+    hls = new Hls();
+    hls.loadSource(c.url); hls.attachMedia(v);
+    hls.on(Hls.Events.MANIFEST_PARSED, () => { v.play().catch(() => {}); say(""); });
+    hls.on(Hls.Events.ERROR, (_, d) => { if (d.fatal) say("This stream failed to load. It may be offline, blocked by CORS, or served over plain HTTP.", true); });
+  } else {
+    v.src = c.url;
+    v.play().then(() => say("")).catch(() => say("Couldn't play this stream in the browser.", true));
+  }
+}
+v.addEventListener("playing", () => say(""));
+v.addEventListener("error", () => { if (!hls) say("This stream isn't playable in the browser (format, CORS or HTTP-on-HTTPS).", true); });
+
+async function loadURL(u){
+  say("Loading playlist…");
+  try {
+    const r = await fetch(u);
+    if (!r.ok) throw new Error(r.status);
+    const list_ = parseM3U(await r.text());
+    if (!list_.length) throw new Error("empty");
+    setChannels(list_); safeSet("iptv.url", u);
+    say(`Loaded ${list_.length} channels.`);
+  } catch {
+    say("Couldn't load that playlist from the browser (the server may block cross-site requests, or the link isn't an M3U). Download the file and use Open file instead.", true);
+  }
+}
+
+$("load").onsubmit = e => { e.preventDefault(); const u = $("url").value.trim(); if (u) loadURL(u); };
+$("pick").onclick = () => $("file").click();
+$("file").onchange = async e => {
+  const f = e.target.files[0]; if (!f) return;
+  const list_ = parseM3U(await f.text());
+  if (!list_.length) return say("No channels found in that file.", true);
+  setChannels(list_); say(`Loaded ${list_.length} channels from ${f.name}.`);
+};
+$("q").oninput = render; $("grp").onchange = render;
+
+const start = safeGet("iptv.url", "") || DEFAULT_PLAYLIST;
+$("url").value = start;
+if (start) loadURL(start);
+</script>
+</body>
+</html>
